@@ -35,6 +35,12 @@ scripts/run_relay.sh        启动中继
 
 ## 1. 中继 VM（10.103.238.110，数据网卡 ens192=10.103.238.111）
 
+> **注意（DPDK 指令集）**：本机 vCPU（VMware）只暴露 SSE4、无 AVX。若 `/usr/local`
+> 的 DPDK 是用 `-march=native`（含 AVX）编的，任何 DPDK 程序会开机即 SIGILL
+> （`trap invalid opcode in librte_*.so`）。需用源码以 `-Dcpu_instruction_set=nehalem`
+> 重编安装 DPDK，并清掉 `dpdk/pmds-24.0/` 里残留的旧 AVX 驱动（只保留 SSE 版的
+> bus_pci / bus_vdev / mempool_ring / net_vmxnet3）。本仓库部署的 VM 已处理好。
+
 ```bash
 # 编译
 cd ~/cnp-relay/relay

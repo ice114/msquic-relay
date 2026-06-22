@@ -505,6 +505,8 @@ static uint32_t parse_ipv4(const char *s) {
 }
 
 int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: see logs live */
+
     int ret = rte_eal_init(argc, argv);
     if (ret < 0) rte_panic("EAL init failed\n");
     argc -= ret; argv += ret;
