@@ -1,0 +1,9 @@
+# build artifacts
+relay/build/
+shim/shim
+*.o
+*.obj
+
+# editor / OS
+.DS_Store
+*.swp
