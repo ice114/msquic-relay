@@ -216,7 +216,13 @@ static void forward_to(struct rte_mbuf *m, struct rte_ether_hdr *eth,
 
 /* ----------------------------- CNP injection -------------------------- */
 static void inject_cnp(struct flow *f, uint64_t t) {
-    if (!f->have_client || f->client_cid_len == 0) return;
+    //
+    // Address the flow by tunnel flow_id, NOT by QUIC CID: secnetperf clients
+    // use a zero-length source CID, so the relay cannot sniff a usable CID. The
+    // CNP is sent with cidlen 0; the client shim routes it to the right msquic
+    // by flow_id, and msquic's single-connection binding accepts a CID-less CNP.
+    //
+    if (!f->have_client) return;
     if (t - f->last_cnp_tsc < (uint64_t)CNP_MIN_INTERVAL_US * g_tsc_us) return;
 
     struct rte_mbuf *m = rte_pktmbuf_alloc(g_pool);
@@ -228,8 +234,19 @@ static void inject_cnp(struct flow *f, uint64_t t) {
     struct tunnel_header *th  = (struct tunnel_header *)(udp + 1);
     uint8_t              *cnp = (uint8_t *)(th + 1);
 
-    int cnp_len = cnp_build(cnp, f->client_cid, f->client_cid_len,
-                            CNP_SUPPRESS_MS, 1);
+    //
+    // Severity scales with how far the flow is over the elephant threshold:
+    // 1x over => mild, >=5x over => hardest. The sender's BBR interprets
+    // severity as "cut harder" (keep ~= 100 - severity percent of the window).
+    //
+    uint8_t severity;
+    {
+        uint64_t ratio = f->bytes_per_sec / (g_cfg.threshold_bps ? g_cfg.threshold_bps : 1);
+        if (ratio <= 1)      severity = 50;   /* keep ~50% */
+        else if (ratio >= 5) severity = 90;   /* keep ~10% */
+        else                 severity = (uint8_t)(50 + (ratio - 1) * 10); /* 60..80 */
+    }
+    int cnp_len = cnp_build(cnp, NULL, 0, CNP_SUPPRESS_MS, severity);
     if (cnp_len < 0) { rte_pktmbuf_free(m); return; }
 
     /* tunnel header: tell the client shim "deliver this CNP to flow X". */
@@ -310,15 +327,11 @@ static void process_tunnel(struct rte_mbuf *m, struct rte_ether_hdr *eth,
         forward_to(m, eth, ip, udp,
                    th->orig_dst_ip, th->orig_dst_port, g_gw_mac.addr_bytes);
     } else { /* TUNNEL_DIR_S2C */
-        /* Sniff the client's QUIC DestCID from the inner 1-RTT short header. */
-        if (f->client_cid_len == 0 && plen > 0) {
-            uint8_t cid[CNP_MAX_CID_LEN];
-            int got = quic_short_header_dcid(inner, plen, g_cfg.cid_len, cid);
-            if (got > 0) {
-                memcpy(f->client_cid, cid, got);
-                f->client_cid_len = (uint8_t)got;
-            }
-        }
+        //
+        // CNP is addressed by tunnel flow_id, not by QUIC CID (clients use a
+        // zero-length source CID), so no inner-header CID sniffing is needed.
+        //
+        (void)inner;
         if (!f->have_client) { rte_pktmbuf_free(m); return; }
         /* Forward back to the client. */
         forward_to(m, eth, ip, udp,
