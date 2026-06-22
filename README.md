@@ -1,8 +1,13 @@
-# cnp-relay — DPDK 中继数据平面 + 端侧网关 (CNP 实验)
+# msquic-relay — DPDK 中继数据平面 (CNP 实验)
 
 一个用于验证 **out-of-band CNP（Congestion Notification Packet）拥塞抑制** 的实验系统：
 DPDK 中继在线抓流、识别大流（heavy hitter），对大流的发送端注入 CNP 包，
 触发已 patch 的 msquic 的 BBR 增窗抑制（`CnpSuppressUntil`）。
+
+> **端侧组件**（打了 CNP patch 的 msquic + 网关 shim）在配套仓库
+> [`msquic-cnp`](https://github.com/ice114/msquic-cnp)（其 `cnp-gateway/` 目录）。
+> 本仓库只含中继（DPDK 数据平面）。`include/tunnel_protocol.h` 是两仓库共享的线格式，
+> 保持一致。
 
 ```
  客户端主机 (Mac)                          中继 VM (ens192)                服务端主机 (10.29.75.103)
