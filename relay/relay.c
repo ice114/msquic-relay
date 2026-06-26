@@ -113,6 +113,7 @@ struct relay_cfg {
     uint8_t  anticnp_on;        /* inject anti-CNP on random loss       */
     uint8_t  force_random;      /* ablation: treat ALL loss as random   */
     uint8_t  seg_id;            /* this relay's segment id (diagnostics) */
+    uint8_t  probe_next;        /* actively 4-timestamp-probe the next-hop (relay) */
 };
 static struct relay_cfg g_cfg = {
     .relay_ip      = 0,                 /* set in main (default 10.103.238.111) */
@@ -174,6 +175,16 @@ static struct rte_ether_addr      g_gw_mac;          /* learned from RX */
 static int                        g_gw_mac_known = 0;
 static uint64_t                   g_tsc_hz = 0, g_tsc_us = 1, g_tsc_ms = 1;
 
+/* Single upstream neighbor (prev-hop) toward the client: in a chain all C2S
+ * traffic arrives from one neighbor, so the relay needs only ONE return
+ * address (no per-flow state) for S2C forwarding, CNP, and broadcast anti-CNP. */
+static uint32_t  g_prev_ip = 0;      /* network order */
+static uint16_t  g_prev_port = 0;    /* network order */
+static uint8_t   g_prev_mac[6];
+static uint8_t   g_prev_known = 0;
+static uint64_t  g_bcast_last_tsc = 0;   /* last healthy-broadcast anti-CNP */
+static uint64_t  g_bcast_count = 0;
+
 static uint64_t now_tsc(void) { return rte_rdtsc(); }
 
 /* ----------------------------- egress shaper -------------------------- */
@@ -193,8 +204,44 @@ static uint64_t  g_tok_last_tsc = 0;
 static uint64_t  g_egress_loss_drops = 0;           /* random drops */
 static uint64_t  g_egress_full_drops = 0;           /* FIFO-full tail drops */
 
+/* ----------------------------- 4-timestamp PROBE --------------------- */
+/*
+ * This relay actively probes its next-hop segment with the classic 4-timestamp
+ * exchange (no clock sync needed): PROBE carries t1 (our tsc); the next hop
+ * stamps t2 on receive, t3 on echo, and returns t1 + (t3-t2 as microseconds in
+ * ITS clock); we take t4 on receive and compute
+ *   RTT_us = (t4 - t1)/our_tsc_us  -  echo_delay_us.
+ * The probe traverses our egress shaper (so it sees the emulated segment delay
+ * and any standing queue) but is exempt from random loss. RTprop = min RTT
+ * (propagation); RttRecent - RTprop = queueing delay on the segment.
+ */
+#define PROBE_BOOT_INTERVAL_US 10000        /* before RTprop is known */
+#define PROBE_RTPROP_WIN_US    2000000      /* refresh the RTprop floor every 2s */
+static uint64_t g_seg_rtprop_us = UINT64_MAX;
+static uint64_t g_seg_rtt_us    = 0;        /* EWMA recent RTT */
+static uint64_t g_seg_rtprop_stamp = 0;     /* tsc of last RTprop refresh */
+static uint64_t g_probe_last_tsc = 0;
+static uint64_t g_probe_count = 0;
+
 static inline int shaper_enabled(void) {
     return g_cfg.egress_rate_bps || g_cfg.egress_delay_tsc || g_cfg.egress_loss_ppm;
+}
+
+/*
+ * Congestion backlog = FIFO bytes beyond the in-flight propagation BDP
+ * (rate * delay). A big propagation delay fills the FIFO with ~BDP bytes that
+ * are NOT congestion (they're "on the wire"); only the excess above BDP is a
+ * real standing queue. This is what separates "big RTT" from "congested" so
+ * the classifier doesn't false-positive on a long-haul-but-uncongested segment.
+ */
+static inline uint64_t cong_backlog(void) {
+    /* A standing queue only forms when a rate limit is in effect; without one
+     * the FIFO holds only in-flight (propagation) bytes, which are NOT
+     * congestion. So no rate limit => cong 0 (a long-haul-but-uncongested
+     * segment must not read as congested). */
+    if (!g_cfg.egress_rate_bps) return 0;
+    uint64_t bdp = (g_cfg.egress_rate_bps * g_cfg.egress_delay_ms) / 1000;
+    return (g_sq_bytes > bdp) ? (g_sq_bytes - bdp) : 0;
 }
 
 /* ----------------------------- hashing -------------------------------- */
@@ -274,8 +321,8 @@ static inline void fix_l3l4(struct rte_ipv4_hdr *ip, struct rte_udp_hdr *udp) {
  * either passes straight through (no rate/delay configured) or queues it in the
  * FIFO to be released by shaper_drain. Takes ownership of `m`.
  */
-static void shaper_enqueue(struct rte_mbuf *m, uint64_t t) {
-    if (g_cfg.egress_loss_ppm) {
+static void shaper_enqueue(struct rte_mbuf *m, uint64_t t, int allow_loss) {
+    if (allow_loss && g_cfg.egress_loss_ppm) {
         if ((rte_rand() % 1000000u) < g_cfg.egress_loss_ppm) {
             rte_pktmbuf_free(m);
             g_egress_loss_drops++;
@@ -355,7 +402,7 @@ static void forward_to(struct rte_mbuf *m, struct rte_ether_hdr *eth,
     udp->dst_port = dst_port_net;         /* already network order */
 
     fix_l3l4(ip, udp);
-    if (via_shaper && shaper_enabled()) shaper_enqueue(m, t);
+    if (via_shaper && shaper_enabled()) shaper_enqueue(m, t, 1 /* allow_loss */);
     else                                tx_enqueue(m);
 }
 
@@ -482,6 +529,157 @@ static void inject_anticnp(struct flow *f, uint64_t t) {
     }
 }
 
+/* ----------------------------- broadcast anti-CNP --------------------- */
+/*
+ * Segment-level anti-CNP: when this segment is healthy, periodically send ONE
+ * anti-CNP toward the upstream gateway with flow_id=0 (broadcast marker). It
+ * propagates S2C hop-by-hop to the client-shim, which fans it out to EVERY
+ * local flow. This is the scalable form: one packet per gateway per period
+ * instead of one per flow, and it preemptively tolerates random loss on a
+ * healthy segment (no per-flow loss detection needed).
+ */
+static void inject_anticnp_broadcast(uint64_t t, uint32_t window_ms) {
+    if (!g_prev_known) return;
+    uint8_t buf[ACN_MAX_LEN];
+    int acn_len = acn_build(buf, NULL, 0, window_ms, 0);
+    if (acn_len < 0) return;
+
+    struct rte_mbuf *m = rte_pktmbuf_alloc(g_pool);
+    if (!m) return;
+    struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+    struct rte_ipv4_hdr  *ip  = (struct rte_ipv4_hdr *)(eth + 1);
+    struct rte_udp_hdr   *udp = (struct rte_udp_hdr *)(ip + 1);
+    struct tunnel_header *th  = (struct tunnel_header *)(udp + 1);
+    uint8_t              *body = (uint8_t *)(th + 1);
+
+    memset(th, 0, sizeof(*th));
+    th->magic       = rte_cpu_to_be_32(TUNNEL_MAGIC);
+    th->version     = TUNNEL_VERSION;
+    th->type        = TUNNEL_TYPE_ANTICNP;
+    th->direction   = TUNNEL_DIR_S2C;
+    th->flow_id     = 0;                         /* 0 = broadcast to all flows */
+    th->payload_len = rte_cpu_to_be_16((uint16_t)acn_len);
+    memcpy(body, buf, acn_len);
+
+    uint16_t udp_len = sizeof(*udp) + sizeof(*th) + acn_len;
+    uint16_t ip_len  = sizeof(*ip) + udp_len;
+    rte_ether_addr_copy(&g_relay_mac, &eth->src_addr);
+    memcpy(eth->dst_addr.addr_bytes, g_prev_mac, 6);
+    eth->ether_type     = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    ip->version_ihl     = 0x45;
+    ip->type_of_service = 0;
+    ip->total_length    = rte_cpu_to_be_16(ip_len);
+    ip->packet_id       = 0;
+    ip->fragment_offset = 0;
+    ip->time_to_live    = 64;
+    ip->next_proto_id   = IPPROTO_UDP;
+    ip->src_addr        = rte_cpu_to_be_32(g_cfg.relay_ip);
+    ip->dst_addr        = g_prev_ip;
+    udp->src_port  = rte_cpu_to_be_16(g_cfg.relay_port);
+    udp->dst_port  = g_prev_port;
+    udp->dgram_len = rte_cpu_to_be_16(udp_len);
+    uint16_t total = sizeof(*eth) + ip_len;
+    m->data_len = total; m->pkt_len = total;
+    fix_l3l4(ip, udp);
+    tx_enqueue(m);
+    g_bcast_last_tsc = t;
+    g_bcast_count++;
+}
+
+/* ----------------------------- PROBE send / echo / RTT ---------------- */
+/* Send a PROBE to the next-hop, carrying t1 (our tsc) in the payload. Goes
+ * through the egress shaper (sees the emulated segment delay+queue) but is
+ * exempt from random loss. */
+static void inject_probe(uint64_t t) {
+    if (!g_cfg.next_hop_ip) return;
+    struct rte_mbuf *m = rte_pktmbuf_alloc(g_pool);
+    if (!m) return;
+
+    struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+    struct rte_ipv4_hdr  *ip  = (struct rte_ipv4_hdr *)(eth + 1);
+    struct rte_udp_hdr   *udp = (struct rte_udp_hdr *)(ip + 1);
+    struct tunnel_header *th  = (struct tunnel_header *)(udp + 1);
+    uint8_t              *body = (uint8_t *)(th + 1);
+
+    memset(th, 0, sizeof(*th));
+    th->magic       = rte_cpu_to_be_32(TUNNEL_MAGIC);
+    th->version     = TUNNEL_VERSION;
+    th->type        = TUNNEL_TYPE_PROBE;
+    th->direction   = TUNNEL_DIR_C2S;
+    th->payload_len = rte_cpu_to_be_16(8);
+    memcpy(body, &t, 8);                       /* t1 (our tsc, verbatim) */
+
+    uint16_t udp_len = sizeof(*udp) + sizeof(*th) + 8;
+    uint16_t ip_len  = sizeof(*ip) + udp_len;
+    rte_ether_addr_copy(&g_relay_mac, &eth->src_addr);
+    memcpy(eth->dst_addr.addr_bytes,
+           g_cfg.have_next_hop_mac ? g_cfg.next_hop_mac : g_gw_mac.addr_bytes, 6);
+    eth->ether_type     = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    ip->version_ihl     = 0x45;
+    ip->type_of_service = 0;
+    ip->total_length    = rte_cpu_to_be_16(ip_len);
+    ip->packet_id       = 0;
+    ip->fragment_offset = 0;
+    ip->time_to_live    = 64;
+    ip->next_proto_id   = IPPROTO_UDP;
+    ip->src_addr        = rte_cpu_to_be_32(g_cfg.relay_ip);
+    ip->dst_addr        = rte_cpu_to_be_32(g_cfg.next_hop_ip);
+    udp->src_port  = rte_cpu_to_be_16(g_cfg.relay_port);
+    udp->dst_port  = rte_cpu_to_be_16(g_cfg.next_hop_port);
+    udp->dgram_len = rte_cpu_to_be_16(udp_len);
+    uint16_t total = sizeof(*eth) + ip_len;
+    m->data_len = total; m->pkt_len = total;
+    fix_l3l4(ip, udp);
+    shaper_enqueue(m, t, 0 /* no loss for probes */);
+    g_probe_last_tsc = t;
+}
+
+/* Handle a received PROBE (echo it back) or PROBE_ECHO (compute segment RTT). */
+static void process_probe(struct rte_mbuf *m, struct rte_ether_hdr *eth,
+                          struct rte_ipv4_hdr *ip, struct rte_udp_hdr *udp,
+                          struct tunnel_header *th, uint64_t t) {
+    uint8_t *body = (uint8_t *)(th + 1);
+    if (th->type == TUNNEL_TYPE_PROBE) {
+        /* We are the next-hop: t2 = recv (t), t3 = now; echo t1 + echo_delay. */
+        uint64_t t1; memcpy(&t1, body, 8);
+        uint64_t echo_delay_us = (now_tsc() - t) / g_tsc_us;
+        th->type        = TUNNEL_TYPE_PROBE_ECHO;
+        th->payload_len = rte_cpu_to_be_16(16);
+        memcpy(body, &t1, 8);
+        memcpy(body + 8, &echo_delay_us, 8);
+        /* Send back to the prober (received outer src), unshaped (reverse dir). */
+        uint32_t src_ip = ip->src_addr; uint16_t src_port = udp->src_port;
+        uint8_t src_mac[6]; memcpy(src_mac, eth->src_addr.addr_bytes, 6);
+        uint16_t udp_len = sizeof(*udp) + sizeof(*th) + 16;
+        uint16_t ip_len  = sizeof(*ip) + udp_len;
+        rte_ether_addr_copy(&g_relay_mac, &eth->src_addr);
+        memcpy(eth->dst_addr.addr_bytes, src_mac, 6);
+        ip->src_addr = rte_cpu_to_be_32(g_cfg.relay_ip);
+        ip->dst_addr = src_ip;
+        ip->total_length = rte_cpu_to_be_16(ip_len);
+        udp->src_port = rte_cpu_to_be_16(g_cfg.relay_port);
+        udp->dst_port = src_port;
+        udp->dgram_len = rte_cpu_to_be_16(udp_len);
+        uint16_t total = sizeof(*eth) + ip_len;
+        m->data_len = total; m->pkt_len = total;
+        fix_l3l4(ip, udp);
+        tx_enqueue(m);
+    } else { /* TUNNEL_TYPE_PROBE_ECHO: we are the prober, t4 = now */
+        uint64_t t1, echo_delay_us;
+        memcpy(&t1, body, 8); memcpy(&echo_delay_us, body + 8, 8);
+        uint64_t rtt_us = (t - t1) / g_tsc_us;
+        rtt_us = (rtt_us > echo_delay_us) ? rtt_us - echo_delay_us : 0;
+        /* Windowed-min RTprop (BBR-style: track min, refresh after a window). */
+        if (rtt_us < g_seg_rtprop_us ||
+            (t - g_seg_rtprop_stamp) > (uint64_t)PROBE_RTPROP_WIN_US * g_tsc_us) {
+            g_seg_rtprop_us = rtt_us; g_seg_rtprop_stamp = t;
+        }
+        g_seg_rtt_us = g_seg_rtt_us ? (g_seg_rtt_us * 7 + rtt_us) / 8 : rtt_us;
+        g_probe_count++;
+        rte_pktmbuf_free(m);
+    }
+}
+
 /* ----------------------------- ingress tracking ----------------------- */
 /*
  * Per-flow loss (sequence gaps) and one-way-delay trend, from the seq/send_ts
@@ -537,6 +735,14 @@ static void process_tunnel(struct rte_mbuf *m, struct rte_ether_hdr *eth,
     uint16_t plen     = rte_be_to_cpu_16(th->payload_len);
     uint8_t  dir      = th->direction;
 
+    /* Broadcast anti-CNP (flow_id=0) passing upstream: forward to the single
+     * prev-hop without touching the flow table, until it reaches the gateway. */
+    if (dir == TUNNEL_DIR_S2C && th->type == TUNNEL_TYPE_ANTICNP && flow_id == 0) {
+        if (!g_prev_known) { rte_pktmbuf_free(m); return; }
+        forward_to(m, eth, ip, udp, g_prev_ip, g_prev_port, g_prev_mac, t, 0);
+        return;
+    }
+
     struct flow *f = flow_find(flow_id);
     if (!f) f = flow_create(flow_id, t);
     if (!f) { rte_pktmbuf_free(m); return; }
@@ -545,11 +751,14 @@ static void process_tunnel(struct rte_mbuf *m, struct rte_ether_hdr *eth,
 
     if (dir == TUNNEL_DIR_C2S) {
         /* Learn the upstream neighbor's outer address (prev-hop = where return
-         * traffic and CNP/anti-CNP go). In a chain this is the previous relay. */
+         * traffic and CNP/anti-CNP go). In a chain this is the previous relay;
+         * it is a SINGLE neighbor, cached globally for broadcast/return. */
         f->client_ip   = ip->src_addr;        /* network order */
         f->client_port = udp->src_port;       /* network order */
         memcpy(f->client_mac, eth->src_addr.addr_bytes, 6);
         f->have_client = 1;
+        g_prev_ip = ip->src_addr; g_prev_port = udp->src_port;
+        memcpy(g_prev_mac, eth->src_addr.addr_bytes, 6); g_prev_known = 1;
 
         if (th->type == TUNNEL_TYPE_DATA)
             ingress_track(f, th, t);
@@ -601,7 +810,7 @@ static void detect_and_inject(uint64_t t) {
     last = t;
 
     /* Ground-truth congestion signal: is MY egress backlog deep? */
-    int egress_congested = shaper_enabled() && (g_sq_bytes > g_cfg.congest_q_bytes);
+    int egress_congested = shaper_enabled() && (cong_backlog() > g_cfg.congest_q_bytes);
 
     /*
      * CNP — only when I'm actually the bottleneck (egress backlog deep). Then
@@ -627,25 +836,22 @@ static void detect_and_inject(uint64_t t) {
         for (int i = 0; i < n; i++) inject_cnp(top[i], t);
     }
 
-    /*
-     * anti-CNP — per flow: if new sequence gaps appeared this interval and the
-     * OWD looks flat (no queue => loss looks random), tell the sender not to
-     * back off. Gate: I must NOT be the bottleneck myself (if my egress is
-     * congested I won't mask losses). The force_random ablation skips both the
-     * OWD and the congestion gate to prove the queue/OWD signal is load-bearing.
-     */
-    if (g_cfg.anticnp_on) {
-        for (uint32_t i = 0; i < g_active_cnt; i++) {
-            struct flow *f = &g_flows[g_active_idx[i]];
-            if (!f->used) continue;
-            uint64_t new_loss = f->rx_loss - f->rx_loss_snap;
-            f->rx_loss_snap = f->rx_loss;
-            if (!new_loss) continue;
-            int owd_flat = (f->owd_recent <= f->owd_min + OWD_FLAT_TOL_MS);
-            if (g_cfg.force_random || (owd_flat && !egress_congested))
-                inject_anticnp(f, t);
-        }
-    }
+    /* anti-CNP is now a segment-level HEALTHY broadcast, driven from main_loop
+     * (finer cadence than this 200ms scan); see anticnp_broadcast_tick(). */
+}
+
+/* Healthy-segment broadcast tick: if NOT congested, periodically (adaptive to
+ * RTprop) emit one broadcast anti-CNP toward the gateway. force_random ablation
+ * broadcasts even when congested (masks real congestion loss -> should hurt). */
+static void anticnp_broadcast_tick(uint64_t t) {
+    if (!g_cfg.anticnp_on || !g_prev_known) return;
+    int congested = shaper_enabled() && (cong_backlog() > g_cfg.congest_q_bytes);
+    if (congested && !g_cfg.force_random) return;
+    uint64_t period_us = (g_seg_rtprop_us != UINT64_MAX) ? g_seg_rtprop_us : 50000;
+    if (period_us < 20000)  period_us = 20000;   /* >=20ms */
+    if (period_us > 200000) period_us = 200000;  /* <=200ms */
+    if (t - g_bcast_last_tsc >= period_us * g_tsc_us)
+        inject_anticnp_broadcast(t, (uint32_t)(3 * period_us / 1000)); /* window = 3*period ms */
 }
 
 /* ----------------------------- housekeeping --------------------------- */
@@ -685,13 +891,16 @@ static void print_stats(uint64_t t) {
      * egress backlog is deep; LOSSY if backlog shallow but flows are losing;
      * else HEALTHY. Printed even with signals off (label-only verification). */
     const char *label = "HEALTHY";
-    int congested = shaper_enabled() && (g_sq_bytes > g_cfg.congest_q_bytes);
+    int congested = shaper_enabled() && (cong_backlog() > g_cfg.congest_q_bytes);
     if (congested)      label = "CONGESTED";
     else if (loss > 0)  label = "LOSSY";
-    printf("[relay] seg%u %s flows=%u big=%u total=%.1fMbit q=%" PRIu64
-           "B loss=%" PRIu64 " drops(loss/full)=%" PRIu64 "/%" PRIu64 "\n",
+    uint64_t rtprop = (g_seg_rtprop_us == UINT64_MAX) ? 0 : g_seg_rtprop_us;
+    printf("[relay] seg%u %s flows=%u big=%u total=%.1fMbit cong=%" PRIu64
+           "B q=%" PRIu64 "B loss=%" PRIu64 " drops=%" PRIu64 "/%" PRIu64
+           " probe rtprop=%" PRIu64 "us rtt=%" PRIu64 "us n=%" PRIu64 "\n",
            g_cfg.seg_id, label, g_active_cnt, big, (double)(total * 8) / 1e6,
-           g_sq_bytes, loss, g_egress_loss_drops, g_egress_full_drops);
+           cong_backlog(), g_sq_bytes, loss, g_egress_loss_drops, g_egress_full_drops,
+           rtprop, g_seg_rtt_us, g_probe_count);
 }
 
 /* ----------------------------- main loop ------------------------------ */
@@ -746,13 +955,31 @@ static int main_loop(__rte_unused void *arg) {
             if (ip->dst_addr == relay_ip_be && udp->dst_port == relay_port_be) {
                 struct tunnel_header *th = (struct tunnel_header *)(udp + 1);
                 if (tunnel_is(th, rte_cpu_to_be_32(TUNNEL_MAGIC))) {
-                    process_tunnel(m, eth, ip, udp, th, t);
+                    if (th->type == TUNNEL_TYPE_PROBE ||
+                        th->type == TUNNEL_TYPE_PROBE_ECHO) {
+                        process_probe(m, eth, ip, udp, th, t);
+                    } else {
+                        process_tunnel(m, eth, ip, udp, th, t);
+                    }
                     continue;
                 }
             }
             rte_pktmbuf_free(m);   /* not ours */
         }
 
+        /* Active 4-timestamp probe of the next-hop segment, cadence adaptive to
+         * the measured RTprop (probe ~RTprop/4, clamped 1..50ms). */
+        if (g_cfg.probe_next && g_cfg.next_hop_ip) {
+            uint64_t interval_us = PROBE_BOOT_INTERVAL_US;
+            if (g_seg_rtprop_us != UINT64_MAX) {
+                interval_us = g_seg_rtprop_us / 4;
+                if (interval_us < 1000)  interval_us = 1000;   /* >=1ms  */
+                if (interval_us > 50000) interval_us = 50000;  /* <=50ms */
+            }
+            if (t - g_probe_last_tsc >= interval_us * g_tsc_us) inject_probe(t);
+        }
+
+        anticnp_broadcast_tick(t);   /* healthy-segment broadcast anti-CNP */
         detect_and_inject(t);
         shaper_drain(t);       /* release egress-shaped packets */
         reap_idle(t);
@@ -866,6 +1093,8 @@ int main(int argc, char **argv) {
             g_cfg.egress_qcap_bytes = (uint64_t)atoi(argv[++i]) * 1024;
         else if (!strcmp(argv[i], "--seg-id") && i + 1 < argc)
             g_cfg.seg_id = (uint8_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--probe-next"))
+            g_cfg.probe_next = 1;
         /* signal toggles for A/B/ablation */
         else if (!strcmp(argv[i], "--no-cnp"))      g_cfg.cnp_on = 0;
         else if (!strcmp(argv[i], "--no-anticnp"))  g_cfg.anticnp_on = 0;
