@@ -31,19 +31,27 @@
 /* ----------------------------------------------------------------------- */
 
 #define TUNNEL_MAGIC      0x54554E4Cu  /* "TUNL" as a host-order uint32     */
-#define TUNNEL_VERSION    1
+#define TUNNEL_VERSION    2            /* v2: + seq/send_ts, + ANTICNP/PROBE */
 
 /* tunnel_header.type */
-#define TUNNEL_TYPE_DATA  0  /* inner payload is a raw QUIC datagram        */
-#define TUNNEL_TYPE_CNP   1  /* inner payload is a msquic "CNP1" packet     */
+#define TUNNEL_TYPE_DATA       0  /* inner payload is a raw QUIC datagram        */
+#define TUNNEL_TYPE_CNP        1  /* inner payload is a msquic "CNP1" packet     */
+#define TUNNEL_TYPE_ANTICNP    2  /* inner payload is a msquic "ACN1" packet     */
+#define TUNNEL_TYPE_PROBE      3  /* inter-relay RTT probe (Phase 2b)            */
+#define TUNNEL_TYPE_PROBE_ECHO 4  /* inter-relay RTT probe echo (Phase 2b)       */
 
 /* tunnel_header.direction */
 #define TUNNEL_DIR_C2S    0  /* client -> server                           */
 #define TUNNEL_DIR_S2C    1  /* server -> client (and relay-originated CNP) */
 
 /*
- * 28-byte tunnel header. All multi-byte fields are NETWORK byte order on the
+ * 36-byte tunnel header. All multi-byte fields are NETWORK byte order on the
  * wire. `magic` is compared against htonl(TUNNEL_MAGIC).
+ *
+ * v2 added `seq` and `send_ts` (stamped by the shim on DATA only) so a
+ * downstream relay can detect per-flow loss (sequence gaps) and the
+ * cumulative one-way-delay trend (recv_ms - send_ts) for its segment
+ * classifier — without active probing of the userspace shim.
  */
 struct tunnel_header {
     uint32_t magic;          /* htonl(TUNNEL_MAGIC)                         */
@@ -58,6 +66,8 @@ struct tunnel_header {
     uint32_t orig_dst_ip;    /* for DIR_C2S this is the server-shim addr   */
     uint16_t orig_src_port;  /* network order                              */
     uint16_t orig_dst_port;  /* network order                              */
+    uint32_t seq;            /* htonl(per-flow monotonic seq); DATA only    */
+    uint32_t send_ts;        /* htonl(shim send time, ms low 32); DATA only */
 } __attribute__((packed));
 
 #define TUNNEL_HDR_LEN ((int)sizeof(struct tunnel_header))
@@ -128,6 +138,53 @@ static inline int cnp_build(uint8_t *out, const uint8_t *cid, uint8_t cid_len,
 static inline int cnp_is(const uint8_t *buf, int len) {
     return len >= CNP_MIN_LEN && buf[0] == CNP_MARKER &&
            buf[1] == 'C' && buf[2] == 'N' && buf[3] == 'P' && buf[4] == '1';
+}
+
+/* ----------------------------------------------------------------------- */
+/* msquic "ACN1" anti-CNP wire format (don't-back-off-on-loss signal)      */
+/* ----------------------------------------------------------------------- */
+/*
+ * Byte-for-byte parallel to "CNP1" so msquic's binding hook can share the
+ * same connection-lookup code (by-CID, with the zero-length single-conn
+ * fallback). The only differences from CNP1 are the marker and the meaning
+ * of the two middle bytes:
+ *
+ *   offset size field
+ *   0      1    marker  = 0x00 (QUIC fixed bit clear)
+ *   1      4    magic   = "ACN1"
+ *   5      1    relax_level (0 = unspecified/default)
+ *   6      2    window_ms — how long to relax the loss reaction, LE uint16
+ *   8      1    target DestCid length L
+ *   9      L    target DestCid bytes
+ */
+#define ACN_MARKER       0x00
+#define ACN_MIN_LEN      9
+#define ACN_MAX_CID_LEN  CNP_MAX_CID_LEN
+#define ACN_MAX_LEN      (ACN_MIN_LEN + ACN_MAX_CID_LEN)
+
+/*
+ * Build a msquic anti-CNP packet into `out` (must be >= ACN_MAX_LEN bytes).
+ * `window_ms` (the loss-relaxation window) is clamped to uint16. Returns the
+ * total length written, or -1 on bad args.
+ */
+static inline int acn_build(uint8_t *out, const uint8_t *cid, uint8_t cid_len,
+                            uint32_t window_ms, uint8_t relax_level) {
+    if (cid_len > ACN_MAX_CID_LEN) return -1;
+    if (window_ms > 0xFFFF) window_ms = 0xFFFF;
+    out[0] = ACN_MARKER;
+    out[1] = 'A'; out[2] = 'C'; out[3] = 'N'; out[4] = '1';
+    out[5] = relax_level;
+    out[6] = (uint8_t)(window_ms & 0xFF);            /* little-endian */
+    out[7] = (uint8_t)((window_ms >> 8) & 0xFF);
+    out[8] = cid_len;
+    if (cid_len) memcpy(out + ACN_MIN_LEN, cid, cid_len);
+    return ACN_MIN_LEN + cid_len;
+}
+
+/* TRUE if `buf` (len bytes) is a msquic anti-CNP packet. */
+static inline int acn_is(const uint8_t *buf, int len) {
+    return len >= ACN_MIN_LEN && buf[0] == ACN_MARKER &&
+           buf[1] == 'A' && buf[2] == 'C' && buf[3] == 'N' && buf[4] == '1';
 }
 
 /* ----------------------------------------------------------------------- */
