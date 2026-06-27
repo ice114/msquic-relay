@@ -162,6 +162,12 @@ static inline int cnp_is(const uint8_t *buf, int len) {
  * packets parse as state=RELAX/rate=0 (= legacy "ignore loss" behavior):
  *   9+L    1    seg_state  (ACN_STATE_RELAX=0 / ACN_STATE_CONGESTED=1)
  *   10+L   4    rate_bps   fair-share cap in BYTES/sec, LE uint32 (0 = none)
+ *   14+L   1    seg_id     which segment this beacon describes. The endpoint
+ *                          keeps a per-segment state slot and applies the
+ *                          BARREL rule: relax loss only if EVERY fresh segment
+ *                          is RELAX; any CONGESTED segment makes it back off.
+ *                          (Decouples correctness from beacon frequency: each
+ *                          segment owns its slot, no last-writer-wins flapping.)
  *
  * Two segment states, decided by the relay (the segment's ground-truth owner)
  * and broadcast (flow_id=0) so every flow/gateway sees the same thing:
@@ -172,7 +178,7 @@ static inline int cnp_is(const uint8_t *buf, int len) {
  */
 #define ACN_MARKER       0x00
 #define ACN_MIN_LEN      9
-#define ACN_EXT_LEN      5    /* seg_state(1) + rate_bps(4) appended after CID */
+#define ACN_EXT_LEN      6    /* seg_state(1) + rate_bps(4) + seg_id(1) after CID */
 #define ACN_MAX_CID_LEN  CNP_MAX_CID_LEN
 #define ACN_MAX_LEN      (ACN_MIN_LEN + ACN_MAX_CID_LEN + ACN_EXT_LEN)
 
@@ -187,7 +193,7 @@ static inline int cnp_is(const uint8_t *buf, int len) {
  */
 static inline int acn_build(uint8_t *out, const uint8_t *cid, uint8_t cid_len,
                             uint32_t window_ms, uint8_t relax_level,
-                            uint8_t seg_state, uint32_t rate_bps) {
+                            uint8_t seg_state, uint32_t rate_bps, uint8_t seg_id) {
     if (cid_len > ACN_MAX_CID_LEN) return -1;
     if (window_ms > 0xFFFF) window_ms = 0xFFFF;
     out[0] = ACN_MARKER;
@@ -203,6 +209,7 @@ static inline int acn_build(uint8_t *out, const uint8_t *cid, uint8_t cid_len,
     ext[2] = (uint8_t)((rate_bps >> 8) & 0xFF);
     ext[3] = (uint8_t)((rate_bps >> 16) & 0xFF);
     ext[4] = (uint8_t)((rate_bps >> 24) & 0xFF);
+    ext[5] = seg_id;
     return ACN_MIN_LEN + cid_len + ACN_EXT_LEN;
 }
 

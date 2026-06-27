@@ -115,6 +115,20 @@ struct relay_cfg {
     uint8_t  cong_rate;         /* mode(b): CONGESTED beacon carries fair-share rate */
     uint8_t  seg_id;            /* this relay's segment id (diagnostics) */
     uint8_t  probe_next;        /* actively 4-timestamp-probe the next-hop (relay) */
+    uint8_t  probe_congest;     /* also judge congestion from probe RTT inflation */
+    uint32_t congest_qdelay_us; /* probe queueing-delay threshold => "congested"   */
+    uint64_t congest_min_bps;   /* min forwarded rate to attribute congestion to me */
+
+    /* Scheduled step event + ingress trace (control-loop-latency experiment).
+     * At step_at_sec after boot, change the egress bottleneck to model a sudden
+     * congestion onset, logging the apply time in relay-local ms. With
+     * ingress_trace on, the C2S offered rate seen at this relay is printed every
+     * ~100ms; the sender's reaction (rate falling to the new bottleneck) is then
+     * measured ENTIRELY in this relay's clock -- no cross-host sync needed. */
+    uint32_t step_at_sec;       /* 0 = disabled */
+    int64_t  step_rate_bps;     /* new egress rate at step; <0 = leave unchanged */
+    int64_t  step_loss_ppm;     /* new egress loss at step; <0 = leave unchanged */
+    uint8_t  ingress_trace;     /* periodic C2S ingress-rate print (reaction series) */
 };
 static struct relay_cfg g_cfg = {
     .relay_ip      = 0,                 /* set in main (default 10.103.238.111) */
@@ -125,6 +139,10 @@ static struct relay_cfg g_cfg = {
     .egress_qcap_bytes = (1u << 20),             /* 1 MB finite buffer */
     .cnp_on        = 1,
     .anticnp_on    = 1,
+    .congest_qdelay_us = 10000,                  /* 10ms probe queueing => congested */
+    .congest_min_bps = (5ull * 1000 * 1000) / 8, /* >=5Mbit forwarded => could be me */
+    .step_rate_bps = -1,                         /* no scheduled step by default */
+    .step_loss_ppm = -1,
 };
 
 /* ----------------------------- flow table ----------------------------- */
@@ -186,6 +204,13 @@ static uint8_t   g_prev_known = 0;
 static uint64_t  g_bcast_last_tsc = 0;   /* last healthy-broadcast anti-CNP */
 static uint64_t  g_bcast_count = 0;
 
+/* Control-loop-latency experiment state (scheduled step + ingress trace). */
+static uint64_t  g_boot_tsc = 0;          /* main-loop start, for step timing */
+static uint8_t   g_step_done = 0;         /* step already applied (timer or ctl)? */
+static uint64_t  g_ingress_bytes = 0;     /* C2S DATA bytes since last itrace */
+static uint64_t  g_itrace_last_tsc = 0;
+static char      g_step_ctl[256] = {0};   /* --step-ctl path: trigger step on demand */
+
 static uint64_t now_tsc(void) { return rte_rdtsc(); }
 
 /* ----------------------------- egress shaper -------------------------- */
@@ -243,6 +268,29 @@ static inline uint64_t cong_backlog(void) {
     if (!g_cfg.egress_rate_bps) return 0;
     uint64_t bdp = (g_cfg.egress_rate_bps * g_cfg.egress_delay_ms) / 1000;
     return (g_sq_bytes > bdp) ? (g_sq_bytes - bdp) : 0;
+}
+
+/* Probe-measured queueing delay = recent segment RTT above its propagation
+ * floor (RTprop). Unlike cong_backlog (which reads this relay's OWN egress
+ * FIFO), this detects congestion ANYWHERE on the segment -- including a real
+ * bottleneck the relay does NOT own (the realistic deployment: the relay
+ * forwards into a congested link rather than imposing the limit itself). Needs
+ * the active 4-timestamp probe (--probe-next). */
+static inline uint64_t probe_qdelay_us(void) {
+    if (g_seg_rtprop_us == UINT64_MAX || g_seg_rtt_us <= g_seg_rtprop_us) return 0;
+    return g_seg_rtt_us - g_seg_rtprop_us;
+}
+
+/* Unified segment-congestion verdict, fusing two sensors: my local egress
+ * backlog is deep (I own the bottleneck), OR the probe shows the segment RTT
+ * inflating beyond its propagation floor (something downstream on the segment is
+ * queueing). The fusion lets the same relay work whether or not it co-locates
+ * with the bottleneck -- this is what makes detection defensible off the
+ * testbed, where the relay rarely is the physical bottleneck. */
+static inline int seg_congested(void) {
+    if (shaper_enabled() && cong_backlog() > g_cfg.congest_q_bytes) return 1;
+    if (g_cfg.probe_congest && probe_qdelay_us() > g_cfg.congest_qdelay_us) return 1;
+    return 0;
 }
 
 /* ----------------------------- hashing -------------------------------- */
@@ -515,7 +563,7 @@ static void inject_anticnp(struct flow *f, uint64_t t) {
 
     uint8_t buf[ACN_MAX_LEN];
     int acn_len = acn_build(buf, NULL, 0, ANTICNP_WINDOW_MS, 0 /* default relax */,
-                            ACN_STATE_RELAX, 0);
+                            ACN_STATE_RELAX, 0, g_cfg.seg_id);
     if (acn_len < 0) return;
 
     inject_control(f, TUNNEL_TYPE_ANTICNP, buf, acn_len);
@@ -545,7 +593,7 @@ static void inject_anticnp_broadcast(uint64_t t, uint32_t window_ms,
                                      uint8_t seg_state, uint32_t rate_bps) {
     if (!g_prev_known) return;
     uint8_t buf[ACN_MAX_LEN];
-    int acn_len = acn_build(buf, NULL, 0, window_ms, 0, seg_state, rate_bps);
+    int acn_len = acn_build(buf, NULL, 0, window_ms, 0, seg_state, rate_bps, g_cfg.seg_id);
     if (acn_len < 0) return;
 
     struct rte_mbuf *m = rte_pktmbuf_alloc(g_pool);
@@ -673,11 +721,14 @@ static void process_probe(struct rte_mbuf *m, struct rte_ether_hdr *eth,
         memcpy(&t1, body, 8); memcpy(&echo_delay_us, body + 8, 8);
         uint64_t rtt_us = (t - t1) / g_tsc_us;
         rtt_us = (rtt_us > echo_delay_us) ? rtt_us - echo_delay_us : 0;
-        /* Windowed-min RTprop (BBR-style: track min, refresh after a window). */
-        if (rtt_us < g_seg_rtprop_us ||
-            (t - g_seg_rtprop_stamp) > (uint64_t)PROBE_RTPROP_WIN_US * g_tsc_us) {
-            g_seg_rtprop_us = rtt_us; g_seg_rtprop_stamp = t;
-        }
+        /* RTprop = propagation floor = running MINIMUM of probe RTT. Update only
+         * DOWNWARD: a queue-inflated sample must never raise the floor (the old
+         * "re-baseline to the current sample every 2s" poisoned RTprop under
+         * sustained congestion -> qdelay collapsed). The segment's propagation is
+         * ~static; a production deployment would re-baseline on BBR-ProbeRTT-style
+         * periodic drains for route changes, but for these controlled segments the
+         * running min (measured before/between bursts) is the true floor. */
+        if (rtt_us < g_seg_rtprop_us) { g_seg_rtprop_us = rtt_us; g_seg_rtprop_stamp = t; }
         g_seg_rtt_us = g_seg_rtt_us ? (g_seg_rtt_us * 7 + rtt_us) / 8 : rtt_us;
         g_probe_count++;
         rte_pktmbuf_free(m);
@@ -764,8 +815,10 @@ static void process_tunnel(struct rte_mbuf *m, struct rte_ether_hdr *eth,
         g_prev_ip = ip->src_addr; g_prev_port = udp->src_port;
         memcpy(g_prev_mac, eth->src_addr.addr_bytes, 6); g_prev_known = 1;
 
-        if (th->type == TUNNEL_TYPE_DATA)
+        if (th->type == TUNNEL_TYPE_DATA) {
             ingress_track(f, th, t);
+            g_ingress_bytes += plen;   /* offered rate seen at this relay (itrace) */
+        }
 
         /* C2S forward: to the configured next-hop (chain) or, if unset, the
          * tunnel header's orig_dst (single-relay fallback). Apply the egress
@@ -813,21 +866,40 @@ static void detect_and_inject(uint64_t t) {
     if (t - last < (uint64_t)DETECT_INTERVAL_US * g_tsc_us) return;
     last = t;
 
-    /* Ground-truth congestion signal: is MY egress backlog deep? */
-    int egress_congested = shaper_enabled() && (cong_backlog() > g_cfg.congest_q_bytes);
+    /* Aggregate rate I'm forwarding into my downstream segment, and active count. */
+    uint64_t fwd_bps = 0; uint32_t nf = 0;
+    for (uint32_t i = 0; i < g_active_cnt; i++) {
+        struct flow *f = &g_flows[g_active_idx[i]];
+        if (!f->used) continue;
+        fwd_bps += f->bytes_per_sec; nf++;
+    }
 
     /*
-     * CNP — only when I'm actually the bottleneck (egress backlog deep). Then
-     * throttle the Top-K elephants by rate. If my egress is shallow I send no
-     * CNP even if a flow is "big": being big isn't a problem without congestion
-     * (this is what avoids 误伤 / throttling flows I'm not bottlenecking).
+     * CNP fires only on SELF-INDUCED congestion — the segment RTT is inflating
+     * AND I am the one loading it (my forwarded rate is significant). That
+     * attributes the queue to MY traffic without owning the queue: a downstream
+     * bottleneck I'm filling counts, while RTT rising with my rate flat (背景流
+     * 或换路) does NOT. (Rigorous form: dRTT/d(my rate) > 0; here the conjunction
+     * is sufficient because in our setting my flows are the dominant load.)
+     * Local egress backlog deep is an additional sufficient trigger (I literally
+     * AM the queue). RTT-alone never triggers CNP — it only sets the beacon state.
      */
-    if (g_cfg.cnp_on && egress_congested) {
+    int self_induced = g_cfg.probe_congest &&
+                       (probe_qdelay_us() > g_cfg.congest_qdelay_us) &&
+                       (fwd_bps > g_cfg.congest_min_bps);
+    int local_bottleneck = shaper_enabled() && (cong_backlog() > g_cfg.congest_q_bytes);
+
+    if (g_cfg.cnp_on && (self_induced || local_bottleneck)) {
+        /* Top-K elephants by SHARE, not absolute bandwidth: trim the flows above
+         * their fair share (= aggregate / active), largest first. An "elephant"
+         * is whoever takes a big share of THIS bottleneck, so a 10Mbit flow is an
+         * elephant on a 25Mbit link and a mouse on a 1Gbit link -- relative. */
+        uint64_t fair = nf ? (fwd_bps / nf) : 0;
         struct flow *top[CNP_TOP_K];
         int n = 0;
         for (uint32_t i = 0; i < g_active_cnt; i++) {
             struct flow *f = &g_flows[g_active_idx[i]];
-            if (!f->used || f->bytes_per_sec <= g_cfg.threshold_bps) continue;
+            if (!f->used || f->bytes_per_sec <= fair) continue;   /* only above fair share */
             if (n < CNP_TOP_K) {
                 top[n++] = f;
             } else {
@@ -860,7 +932,7 @@ static void anticnp_broadcast_tick(uint64_t t) {
     if (period_us > 200000) period_us = 200000;  /* <=200ms */
     if (t - g_bcast_last_tsc < period_us * g_tsc_us) return;
 
-    int congested = shaper_enabled() && (cong_backlog() > g_cfg.congest_q_bytes);
+    int congested = seg_congested();
     uint8_t  seg_state = ACN_STATE_RELAX;
     uint32_t rate_bps  = 0;
     if (congested && !g_cfg.force_random) {
@@ -874,9 +946,9 @@ static void anticnp_broadcast_tick(uint64_t t) {
 
     static uint64_t last_log = 0;
     if (t - last_log > g_tsc_hz) {       /* at most ~1 beacon log/sec */
-        printf("[relay] seg%u beacon %s cong=%" PRIu64 "B q=%" PRIu64 "B n=%u rate=%.1fMbit\n",
+        printf("[relay] seg%u beacon %s cong=%" PRIu64 "B q=%" PRIu64 "B qdelay=%" PRIu64 "us n=%u rate=%.1fMbit\n",
                g_cfg.seg_id, seg_state == ACN_STATE_CONGESTED ? "CONGESTED" : "RELAX",
-               cong_backlog(), g_sq_bytes, g_active_cnt, (double)((uint64_t)rate_bps * 8) / 1e6);
+               cong_backlog(), g_sq_bytes, probe_qdelay_us(), g_active_cnt, (double)((uint64_t)rate_bps * 8) / 1e6);
         last_log = t;
     }
 }
@@ -918,16 +990,68 @@ static void print_stats(uint64_t t) {
      * egress backlog is deep; LOSSY if backlog shallow but flows are losing;
      * else HEALTHY. Printed even with signals off (label-only verification). */
     const char *label = "HEALTHY";
-    int congested = shaper_enabled() && (cong_backlog() > g_cfg.congest_q_bytes);
+    int congested = seg_congested();
     if (congested)      label = "CONGESTED";
     else if (loss > 0)  label = "LOSSY";
     uint64_t rtprop = (g_seg_rtprop_us == UINT64_MAX) ? 0 : g_seg_rtprop_us;
     printf("[relay] seg%u %s flows=%u big=%u total=%.1fMbit cong=%" PRIu64
            "B q=%" PRIu64 "B loss=%" PRIu64 " drops=%" PRIu64 "/%" PRIu64
-           " probe rtprop=%" PRIu64 "us rtt=%" PRIu64 "us n=%" PRIu64 "\n",
+           " probe rtprop=%" PRIu64 "us rtt=%" PRIu64 "us qdelay=%" PRIu64 "us n=%" PRIu64 "\n",
            g_cfg.seg_id, label, g_active_cnt, big, (double)(total * 8) / 1e6,
            cong_backlog(), g_sq_bytes, loss, g_egress_loss_drops, g_egress_full_drops,
-           rtprop, g_seg_rtt_us, g_probe_count);
+           rtprop, g_seg_rtt_us, probe_qdelay_us(), g_probe_count);
+}
+
+/* Control-loop-latency experiment: a one-shot scheduled bottleneck step plus a
+ * fine-grained ingress-rate trace, both stamped in relay-local ms. The step
+ * models a sudden congestion onset; the sender's reaction (offered rate falling
+ * to the new bottleneck) is then read off the itrace series against the APPLY
+ * timestamp -- entirely in this relay's clock, so no cross-host sync is needed.
+ * overlay-on (CNP closes the loop over sender<->relay) reacts in ~segA RTT;
+ * overlay-off (end-to-end BBR) reacts in ~full RTT, growing with downstream
+ * delay -- that gap, swept over downstream delay, is the loop-shortening proof. */
+static void step_and_trace_tick(uint64_t t) {
+    /* timer-driven step (boot-relative) */
+    if (g_cfg.step_at_sec && !g_step_done &&
+        (t - g_boot_tsc) >= (uint64_t)g_cfg.step_at_sec * g_tsc_hz) {
+        if (g_cfg.step_rate_bps >= 0) g_cfg.egress_rate_bps = (uint64_t)g_cfg.step_rate_bps;
+        if (g_cfg.step_loss_ppm >= 0) g_cfg.egress_loss_ppm = (uint32_t)g_cfg.step_loss_ppm;
+        g_step_done = 1;
+        printf("[ctl] tms=%" PRIu64 " APPLY rate=%.1fMbit loss=%.2f%%\n",
+               t / g_tsc_ms, (double)(g_cfg.egress_rate_bps * 8) / 1e6,
+               (double)g_cfg.egress_loss_ppm / 10000.0);
+    }
+    /* control-file step (on demand): the harness writes the new rate (Mbps) once
+     * the flow is steady, so the step is timed to actual load rather than boot.
+     * The apply time is stamped here in relay-local ms regardless of the trigger. */
+    if (g_step_ctl[0] && !g_step_done) {
+        static uint64_t last_chk = 0;
+        if (t - last_chk >= g_tsc_hz / 5) {          /* poll ~5x/sec */
+            last_chk = t;
+            FILE *fp = fopen(g_step_ctl, "r");
+            if (fp) {
+                int rate = -1;
+                if (fscanf(fp, "%d", &rate) == 1 && rate >= 0) {
+                    g_cfg.egress_rate_bps = ((uint64_t)rate * 1000 * 1000) / 8;
+                    g_step_done = 1;
+                    printf("[ctl] tms=%" PRIu64 " APPLY rate=%.1fMbit loss=%.2f%% (ctl)\n",
+                           t / g_tsc_ms, (double)(g_cfg.egress_rate_bps * 8) / 1e6,
+                           (double)g_cfg.egress_loss_ppm / 10000.0);
+                }
+                fclose(fp);
+            }
+        }
+    }
+    if (g_cfg.ingress_trace) {
+        uint64_t win = t - g_itrace_last_tsc;
+        if (win >= g_tsc_hz / 10) {                  /* ~100ms sample */
+            double mbit = (double)g_ingress_bytes * 8.0 * g_tsc_hz / (double)win / 1e6;
+            printf("[itrace] tms=%" PRIu64 " in=%.2fMbit cong=%" PRIu64 "B\n",
+                   t / g_tsc_ms, mbit, cong_backlog());
+            g_ingress_bytes = 0;
+            g_itrace_last_tsc = t;
+        }
+    }
 }
 
 /* ----------------------------- main loop ------------------------------ */
@@ -952,6 +1076,9 @@ static int main_loop(__rte_unused void *arg) {
         sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) + TUNNEL_HDR_LEN;
     uint32_t relay_ip_be = rte_cpu_to_be_32(g_cfg.relay_ip);
     uint16_t relay_port_be = rte_cpu_to_be_16(g_cfg.relay_port);
+
+    g_boot_tsc = now_tsc();
+    g_itrace_last_tsc = g_boot_tsc;
 
     for (;;) {
         struct rte_mbuf *pkts[MAX_PKT_BURST];
@@ -1011,6 +1138,7 @@ static int main_loop(__rte_unused void *arg) {
         shaper_drain(t);       /* release egress-shaped packets */
         reap_idle(t);
         print_stats(t);
+        step_and_trace_tick(t);   /* scheduled bottleneck step + ingress trace */
         tx_flush();
     }
     return 0;
@@ -1122,6 +1250,12 @@ int main(int argc, char **argv) {
             g_cfg.seg_id = (uint8_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--probe-next"))
             g_cfg.probe_next = 1;
+        else if (!strcmp(argv[i], "--probe-congest"))
+            g_cfg.probe_congest = 1;
+        else if (!strcmp(argv[i], "--congest-qdelay-ms") && i + 1 < argc)
+            g_cfg.congest_qdelay_us = (uint32_t)(atof(argv[++i]) * 1000.0);
+        else if (!strcmp(argv[i], "--congest-min-mbps") && i + 1 < argc)
+            g_cfg.congest_min_bps = ((uint64_t)atoi(argv[++i]) * 1000 * 1000) / 8;
         /* signal toggles for A/B/ablation */
         else if (!strcmp(argv[i], "--no-cnp"))      g_cfg.cnp_on = 0;
         else if (!strcmp(argv[i], "--no-anticnp"))  g_cfg.anticnp_on = 0;
@@ -1129,6 +1263,18 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--force-random")) g_cfg.force_random = 1;
         /* mode(b): CONGESTED beacon carries the per-flow fair-share rate cap */
         else if (!strcmp(argv[i], "--cong-rate"))   g_cfg.cong_rate = 1;
+        /* control-loop-latency experiment: scheduled step + ingress trace */
+        else if (!strcmp(argv[i], "--step-at-sec") && i + 1 < argc)
+            g_cfg.step_at_sec = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--step-rate-mbps") && i + 1 < argc)
+            g_cfg.step_rate_bps = ((int64_t)atoi(argv[++i]) * 1000 * 1000) / 8;
+        else if (!strcmp(argv[i], "--step-loss-pct") && i + 1 < argc)
+            g_cfg.step_loss_ppm = (int64_t)(atof(argv[++i]) * 10000.0);
+        else if (!strcmp(argv[i], "--ingress-trace")) g_cfg.ingress_trace = 1;
+        else if (!strcmp(argv[i], "--step-ctl") && i + 1 < argc) {
+            strncpy(g_step_ctl, argv[++i], sizeof(g_step_ctl) - 1);
+            g_step_ctl[sizeof(g_step_ctl) - 1] = '\0';
+        }
     }
 
     g_tsc_hz = rte_get_tsc_hz();
