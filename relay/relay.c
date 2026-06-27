@@ -111,7 +111,8 @@ struct relay_cfg {
     /* Signal toggles (for A/B/ablation experiments). */
     uint8_t  cnp_on;            /* inject CNP when congested            */
     uint8_t  anticnp_on;        /* inject anti-CNP on random loss       */
-    uint8_t  force_random;      /* ablation: treat ALL loss as random   */
+    uint8_t  force_random;      /* ablation: force RELAX even when congested */
+    uint8_t  cong_rate;         /* mode(b): CONGESTED beacon carries fair-share rate */
     uint8_t  seg_id;            /* this relay's segment id (diagnostics) */
     uint8_t  probe_next;        /* actively 4-timestamp-probe the next-hop (relay) */
 };
@@ -513,7 +514,8 @@ static void inject_anticnp(struct flow *f, uint64_t t) {
     if (t - f->last_anticnp_tsc < (uint64_t)ANTICNP_MIN_INTERVAL_US * g_tsc_us) return;
 
     uint8_t buf[ACN_MAX_LEN];
-    int acn_len = acn_build(buf, NULL, 0, ANTICNP_WINDOW_MS, 0 /* default relax */);
+    int acn_len = acn_build(buf, NULL, 0, ANTICNP_WINDOW_MS, 0 /* default relax */,
+                            ACN_STATE_RELAX, 0);
     if (acn_len < 0) return;
 
     inject_control(f, TUNNEL_TYPE_ANTICNP, buf, acn_len);
@@ -531,17 +533,19 @@ static void inject_anticnp(struct flow *f, uint64_t t) {
 
 /* ----------------------------- broadcast anti-CNP --------------------- */
 /*
- * Segment-level anti-CNP: when this segment is healthy, periodically send ONE
- * anti-CNP toward the upstream gateway with flow_id=0 (broadcast marker). It
- * propagates S2C hop-by-hop to the client-shim, which fans it out to EVERY
- * local flow. This is the scalable form: one packet per gateway per period
- * instead of one per flow, and it preemptively tolerates random loss on a
- * healthy segment (no per-flow loss detection needed).
+ * Segment-level state beacon: every period the relay sends ONE anti-CNP toward
+ * the upstream gateway with flow_id=0 (broadcast marker), carrying this
+ * segment's state (RELAX when healthy, CONGESTED when it is a real bottleneck;
+ * with the fair-share rate in mode (b)). It propagates S2C hop-by-hop to the
+ * client-shim, which fans it out to EVERY local flow. This puts the decision
+ * at the segment's ground-truth owner and gives every flow/gateway the same
+ * view (one packet per gateway per period, no per-flow loss detection).
  */
-static void inject_anticnp_broadcast(uint64_t t, uint32_t window_ms) {
+static void inject_anticnp_broadcast(uint64_t t, uint32_t window_ms,
+                                     uint8_t seg_state, uint32_t rate_bps) {
     if (!g_prev_known) return;
     uint8_t buf[ACN_MAX_LEN];
-    int acn_len = acn_build(buf, NULL, 0, window_ms, 0);
+    int acn_len = acn_build(buf, NULL, 0, window_ms, 0, seg_state, rate_bps);
     if (acn_len < 0) return;
 
     struct rte_mbuf *m = rte_pktmbuf_alloc(g_pool);
@@ -840,18 +844,41 @@ static void detect_and_inject(uint64_t t) {
      * (finer cadence than this 200ms scan); see anticnp_broadcast_tick(). */
 }
 
-/* Healthy-segment broadcast tick: if NOT congested, periodically (adaptive to
- * RTprop) emit one broadcast anti-CNP toward the gateway. force_random ablation
- * broadcasts even when congested (masks real congestion loss -> should hurt). */
+/* Segment-state beacon tick: every period (adaptive to RTprop) emit ONE
+ * broadcast anti-CNP toward the gateway carrying this segment's state.
+ *   healthy   -> RELAX     (sender ignores random loss)
+ *   congested -> CONGESTED. mode(b) (--cong-rate) attaches the fair-share rate
+ *                = egress_rate / active_flows (sender ignores random loss but
+ *                caps to its share); mode(a) attaches rate=0 (sender runs
+ *                honest, loss-responsive BBR).
+ * Ablation --force-random forces RELAX even when congested (no discrimination
+ * -> sender ignores the real bottleneck's loss -> should overrun and hurt). */
 static void anticnp_broadcast_tick(uint64_t t) {
     if (!g_cfg.anticnp_on || !g_prev_known) return;
-    int congested = shaper_enabled() && (cong_backlog() > g_cfg.congest_q_bytes);
-    if (congested && !g_cfg.force_random) return;
     uint64_t period_us = (g_seg_rtprop_us != UINT64_MAX) ? g_seg_rtprop_us : 50000;
     if (period_us < 20000)  period_us = 20000;   /* >=20ms */
     if (period_us > 200000) period_us = 200000;  /* <=200ms */
-    if (t - g_bcast_last_tsc >= period_us * g_tsc_us)
-        inject_anticnp_broadcast(t, (uint32_t)(3 * period_us / 1000)); /* window = 3*period ms */
+    if (t - g_bcast_last_tsc < period_us * g_tsc_us) return;
+
+    int congested = shaper_enabled() && (cong_backlog() > g_cfg.congest_q_bytes);
+    uint8_t  seg_state = ACN_STATE_RELAX;
+    uint32_t rate_bps  = 0;
+    if (congested && !g_cfg.force_random) {
+        seg_state = ACN_STATE_CONGESTED;
+        if (g_cfg.cong_rate) {                       /* mode(b): fair-share cap */
+            uint32_t n = g_active_cnt ? g_active_cnt : 1;
+            rate_bps = (uint32_t)(g_cfg.egress_rate_bps / n);
+        }
+    }
+    inject_anticnp_broadcast(t, (uint32_t)(3 * period_us / 1000), seg_state, rate_bps);
+
+    static uint64_t last_log = 0;
+    if (t - last_log > g_tsc_hz) {       /* at most ~1 beacon log/sec */
+        printf("[relay] seg%u beacon %s cong=%" PRIu64 "B q=%" PRIu64 "B n=%u rate=%.1fMbit\n",
+               g_cfg.seg_id, seg_state == ACN_STATE_CONGESTED ? "CONGESTED" : "RELAX",
+               cong_backlog(), g_sq_bytes, g_active_cnt, (double)((uint64_t)rate_bps * 8) / 1e6);
+        last_log = t;
+    }
 }
 
 /* ----------------------------- housekeeping --------------------------- */
@@ -1100,6 +1127,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--no-anticnp"))  g_cfg.anticnp_on = 0;
         else if (!strcmp(argv[i], "--signals-off")) { g_cfg.cnp_on = 0; g_cfg.anticnp_on = 0; }
         else if (!strcmp(argv[i], "--force-random")) g_cfg.force_random = 1;
+        /* mode(b): CONGESTED beacon carries the per-flow fair-share rate cap */
+        else if (!strcmp(argv[i], "--cong-rate"))   g_cfg.cong_rate = 1;
     }
 
     g_tsc_hz = rte_get_tsc_hz();

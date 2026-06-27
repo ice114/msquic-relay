@@ -156,19 +156,38 @@ static inline int cnp_is(const uint8_t *buf, int len) {
  *   6      2    window_ms — how long to relax the loss reaction, LE uint16
  *   8      1    target DestCid length L
  *   9      L    target DestCid bytes
+ *
+ * v2 segment-state extension (appended AFTER the CID, so it survives the old
+ * by-CID layout). Present iff total length >= 9+L+ACN_EXT_LEN; older 9+L
+ * packets parse as state=RELAX/rate=0 (= legacy "ignore loss" behavior):
+ *   9+L    1    seg_state  (ACN_STATE_RELAX=0 / ACN_STATE_CONGESTED=1)
+ *   10+L   4    rate_bps   fair-share cap in BYTES/sec, LE uint32 (0 = none)
+ *
+ * Two segment states, decided by the relay (the segment's ground-truth owner)
+ * and broadcast (flow_id=0) so every flow/gateway sees the same thing:
+ *   RELAX     — segment healthy, only random loss: sender ignores loss.
+ *   CONGESTED — segment is a real bottleneck. rate_bps==0 => sender runs
+ *               honest (loss-responsive) BBR; rate_bps>0 => sender ignores
+ *               random loss but caps its rate to the supplied fair share.
  */
 #define ACN_MARKER       0x00
 #define ACN_MIN_LEN      9
+#define ACN_EXT_LEN      5    /* seg_state(1) + rate_bps(4) appended after CID */
 #define ACN_MAX_CID_LEN  CNP_MAX_CID_LEN
-#define ACN_MAX_LEN      (ACN_MIN_LEN + ACN_MAX_CID_LEN)
+#define ACN_MAX_LEN      (ACN_MIN_LEN + ACN_MAX_CID_LEN + ACN_EXT_LEN)
+
+#define ACN_STATE_RELAX      0
+#define ACN_STATE_CONGESTED  1
 
 /*
  * Build a msquic anti-CNP packet into `out` (must be >= ACN_MAX_LEN bytes).
- * `window_ms` (the loss-relaxation window) is clamped to uint16. Returns the
- * total length written, or -1 on bad args.
+ * `window_ms` (the loss-relaxation window) is clamped to uint16. `seg_state`
+ * is RELAX/CONGESTED; `rate_bps` is the fair-share cap in bytes/sec (0 = none,
+ * meaningful only with CONGESTED). Returns the total length written, or -1.
  */
 static inline int acn_build(uint8_t *out, const uint8_t *cid, uint8_t cid_len,
-                            uint32_t window_ms, uint8_t relax_level) {
+                            uint32_t window_ms, uint8_t relax_level,
+                            uint8_t seg_state, uint32_t rate_bps) {
     if (cid_len > ACN_MAX_CID_LEN) return -1;
     if (window_ms > 0xFFFF) window_ms = 0xFFFF;
     out[0] = ACN_MARKER;
@@ -178,7 +197,13 @@ static inline int acn_build(uint8_t *out, const uint8_t *cid, uint8_t cid_len,
     out[7] = (uint8_t)((window_ms >> 8) & 0xFF);
     out[8] = cid_len;
     if (cid_len) memcpy(out + ACN_MIN_LEN, cid, cid_len);
-    return ACN_MIN_LEN + cid_len;
+    uint8_t *ext = out + ACN_MIN_LEN + cid_len;
+    ext[0] = seg_state;
+    ext[1] = (uint8_t)(rate_bps & 0xFF);             /* little-endian */
+    ext[2] = (uint8_t)((rate_bps >> 8) & 0xFF);
+    ext[3] = (uint8_t)((rate_bps >> 16) & 0xFF);
+    ext[4] = (uint8_t)((rate_bps >> 24) & 0xFF);
+    return ACN_MIN_LEN + cid_len + ACN_EXT_LEN;
 }
 
 /* TRUE if `buf` (len bytes) is a msquic anti-CNP packet. */
