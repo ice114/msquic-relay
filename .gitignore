@@ -7,3 +7,5 @@ shim/shim
 # editor / OS
 .DS_Store
 *.swp
+# testbed orchestration scripts (embed VM creds) — kept local, not committed
+experiments/
