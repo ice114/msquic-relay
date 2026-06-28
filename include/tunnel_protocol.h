@@ -105,23 +105,32 @@ static inline uint32_t tunnel_flow_id(
  *   offset size field
  *   0      1    marker  = 0x00 (QUIC fixed bit clear => unambiguously not QUIC)
  *   1      4    magic   = "CNP1"
- *   5      1    severity hint (0 = unspecified)
+ *   5      1    severity hint (0 = unspecified; legacy, kept for logging)
  *   6      2    suppress duration in milliseconds, LITTLE-endian uint16
  *   8      1    target DestCid length L (the sender's local connection ID)
  *   9      L    target DestCid bytes
+ *
+ * v2 rate extension (appended AFTER the CID, like ACN1's): present iff total
+ * length >= 9+L+CNP_EXT_LEN; older packets parse as rate_bps=0.
+ *   9+L    4    rate_bps  fair-share cap in BYTES/sec, LE uint32. The endpoint
+ *                         sets its BBRv3 lower bounds bw_lo/inflight_lo to this
+ *                         share and holds the flow there (native "back off and
+ *                         don't probe up"), instead of a relative cwnd scale.
  */
 #define CNP_MARKER       0x00
 #define CNP_MIN_LEN      9
+#define CNP_EXT_LEN      4    /* rate_bps(4) after CID */
 #define CNP_MAX_CID_LEN  20   /* QUIC_MAX_CONNECTION_ID_LENGTH_V1 */
-#define CNP_MAX_LEN      (CNP_MIN_LEN + CNP_MAX_CID_LEN)
+#define CNP_MAX_LEN      (CNP_MIN_LEN + CNP_MAX_CID_LEN + CNP_EXT_LEN)
 
 /*
  * Build a msquic CNP packet into `out` (must be >= CNP_MAX_LEN bytes).
  * `cid`/`cid_len` is the target connection's local CID. `suppress_ms` is
- * clamped to uint16. Returns the total length written, or -1 on bad args.
+ * clamped to uint16. `rate_bps` is the flow's fair-share cap in bytes/sec.
+ * Returns the total length written, or -1 on bad args.
  */
 static inline int cnp_build(uint8_t *out, const uint8_t *cid, uint8_t cid_len,
-                            uint32_t suppress_ms, uint8_t severity) {
+                            uint32_t suppress_ms, uint8_t severity, uint32_t rate_bps) {
     if (cid_len > CNP_MAX_CID_LEN) return -1;
     if (suppress_ms > 0xFFFF) suppress_ms = 0xFFFF;
     out[0] = CNP_MARKER;
@@ -131,7 +140,12 @@ static inline int cnp_build(uint8_t *out, const uint8_t *cid, uint8_t cid_len,
     out[7] = (uint8_t)((suppress_ms >> 8) & 0xFF);
     out[8] = cid_len;
     if (cid_len) memcpy(out + CNP_MIN_LEN, cid, cid_len);
-    return CNP_MIN_LEN + cid_len;
+    uint8_t *ext = out + CNP_MIN_LEN + cid_len;
+    ext[0] = (uint8_t)(rate_bps & 0xFF);             /* little-endian */
+    ext[1] = (uint8_t)((rate_bps >> 8) & 0xFF);
+    ext[2] = (uint8_t)((rate_bps >> 16) & 0xFF);
+    ext[3] = (uint8_t)((rate_bps >> 24) & 0xFF);
+    return CNP_MIN_LEN + cid_len + CNP_EXT_LEN;
 }
 
 /* TRUE if `buf` (len bytes) is a msquic CNP packet. */

@@ -67,6 +67,10 @@
 #define DETECT_INTERVAL_US   200000          /* re-scan flows every 200ms     */
 #define CNP_MIN_INTERVAL_US  100000          /* >=100ms between CNPs per flow */
 #define CNP_SUPPRESS_MS      200             /* BBR suppression per CNP       */
+#define CONGEST_HOLD_US      400000          /* keep CNPing 400ms past the last
+                                              * CONGESTED detection, so a queue
+                                              * that momentarily drains (BBR cycle)
+                                              * doesn't let elephants re-ramp     */
 #define CNP_TOP_K            4               /* limit at most K elephants     */
 
 /* anti-CNP (relay-driven "don't back off on this loss" signal). */
@@ -244,10 +248,38 @@ static uint64_t  g_egress_full_drops = 0;           /* FIFO-full tail drops */
 #define PROBE_BOOT_INTERVAL_US 10000        /* before RTprop is known */
 #define PROBE_RTPROP_WIN_US    2000000      /* refresh the RTprop floor every 2s */
 static uint64_t g_seg_rtprop_us = UINT64_MAX;
-static uint64_t g_seg_rtt_us    = 0;        /* EWMA recent RTT */
-static uint64_t g_seg_rtprop_stamp = 0;     /* tsc of last RTprop refresh */
+static uint64_t g_seg_rtt_us    = 0;        /* EWMA recent RTT (for logging)        */
+static uint64_t g_seg_rtprop_stamp = 0;     /* tsc of last RTprop refresh           */
 static uint64_t g_probe_last_tsc = 0;
 static uint64_t g_probe_count = 0;
+/* Windowed-MIN RTT = the STANDING (persistent) queue, CoDel-style. Probe-RTT
+ * jitter (netem timer quantization on the VMs swings a "5ms" delay 4-9ms) and
+ * transient BBR ProbeBW spikes ride ABOVE this; only a queue that never drains
+ * within the window lifts the min. The phase classifier reads this, not the
+ * jittery EWMA, so a clean-but-noisy segment reads qdelay~0 instead of flapping. */
+#define SEG_WMIN_WINDOW_US 200000           /* 200ms standing-queue window          */
+static uint64_t g_seg_rtt_wmin   = UINT64_MAX;  /* published min over last window   */
+static uint64_t g_rtt_wmin_cur   = UINT64_MAX;  /* min accumulator, current window  */
+static uint64_t g_rtt_wmin_stamp = 0;           /* current window start (tsc)       */
+
+/* Segment-phase classifier state (BBR-native RTT-vs-bandwidth diagram). The
+ * thresholds are DIMENSIONLESS fractions of the measured RTprop -- no absolute
+ * ms/Mbps magic numbers. RELAX when the segment RTT sits at its propagation
+ * floor (empty pipe); CONGESTED when RTT is inflated AND my forwarded rate has
+ * plateaued (I push more but deliver no more = hitting the bottleneck, it's
+ * mine); NEUTRAL otherwise. Only a small probe-jitter floor stays absolute. */
+#define SEG_RELAX_NUM    1   /* qdelay <= RTprop * 1/8  -> pipe empty  -> RELAX     */
+#define SEG_RELAX_DEN    8
+#define SEG_CONG_NUM     1   /* qdelay >= RTprop * 1/4  -> inflated    -> CONGESTED */
+#define SEG_CONG_DEN     4
+#define SEG_QD_JITTER_US 1500                  /* probe-jitter noise floor for RELAX */
+#define SEG_BW_GROW_NUM  1   /* fwd rate grew > 1/8 since last tick = still climbing */
+#define SEG_BW_GROW_DEN  8   /* (so NOT plateaued -> not self-induced CONGESTED yet) */
+#define SEG_BW_FLOOR_BPS ((1ull*1000*1000)/8)  /* <1Mbit fwd = no load (noise gate)  */
+enum seg_phase { SEG_PH_RELAX = 0, SEG_PH_NEUTRAL = 1, SEG_PH_CONGESTED = 2 };
+static int      g_bw_saturated = 0;  /* my forwarded rate has plateaued (set in detect) */
+static uint64_t g_fwd_bps      = 0;  /* aggregate rate I forward into the segment        */
+static uint64_t g_congest_hold_until = 0; /* CNP keeps firing until this tsc (hysteresis) */
 
 static inline int shaper_enabled(void) {
     return g_cfg.egress_rate_bps || g_cfg.egress_delay_tsc || g_cfg.egress_loss_ppm;
@@ -277,21 +309,51 @@ static inline uint64_t cong_backlog(void) {
  * forwards into a congested link rather than imposing the limit itself). Needs
  * the active 4-timestamp probe (--probe-next). */
 static inline uint64_t probe_qdelay_us(void) {
-    if (g_seg_rtprop_us == UINT64_MAX || g_seg_rtt_us <= g_seg_rtprop_us) return 0;
-    return g_seg_rtt_us - g_seg_rtprop_us;
+    if (g_seg_rtprop_us == UINT64_MAX) return 0;
+    /* Standing queue = (windowed-min RTT) - RTprop. Take the min of the published
+     * window and the in-progress accumulator: responsive DOWNWARD (a fresh low
+     * sample releases it at once) but smooth UPWARD (needs a whole window of
+     * elevated samples to rise) -> jitter and transient spikes don't register. */
+    uint64_t wmin = g_rtt_wmin_cur;
+    if (g_seg_rtt_wmin < wmin) wmin = g_seg_rtt_wmin;
+    if (wmin == UINT64_MAX || wmin <= g_seg_rtprop_us) return 0;
+    return wmin - g_seg_rtprop_us;
 }
 
-/* Unified segment-congestion verdict, fusing two sensors: my local egress
- * backlog is deep (I own the bottleneck), OR the probe shows the segment RTT
- * inflating beyond its propagation floor (something downstream on the segment is
- * queueing). The fusion lets the same relay work whether or not it co-locates
- * with the bottleneck -- this is what makes detection defensible off the
- * testbed, where the relay rarely is the physical bottleneck. */
-static inline int seg_congested(void) {
-    if (shaper_enabled() && cong_backlog() > g_cfg.congest_q_bytes) return 1;
-    if (g_cfg.probe_congest && probe_qdelay_us() > g_cfg.congest_qdelay_us) return 1;
-    return 0;
+/* Unified segment phase from the BBR-native RTT-vs-bandwidth diagram (and, when
+ * this relay owns the bottleneck, its local egress backlog as ground truth):
+ *   RELAX     : RTT at the propagation floor (qdelay ~ 0) -> empty pipe, so any
+ *               loss here is random -> tell the sender to ignore it.
+ *   CONGESTED : RTT inflated above the floor AND my forwarded rate has plateaued
+ *               (deliver no more though I push more) -> I'm loading the bottleneck
+ *               -> self-induced -> stay honest + throttle my elephant (CNP).
+ *   NEUTRAL   : in between, OR RTT inflated but my rate is NOT saturated (someone
+ *               else's congestion) -> stay honest (don't ignore loss) but do not
+ *               throttle. The safe default == native loss-responsive BBR.
+ * This is the ProbeBW signal per segment; the relax/congest thresholds are
+ * fractions of the measured RTprop, so there are no absolute ms/Mbps knobs. */
+static inline enum seg_phase seg_phase(void) {
+    /* Ground truth when this relay IS the bottleneck owner. */
+    if (shaper_enabled() && cong_backlog() > g_cfg.congest_q_bytes) return SEG_PH_CONGESTED;
+    /* No congestion sensor for this segment (no active probe, and not locally
+     * congested above) -> ABSTAIN with RELAX rather than vetoing. A tail segment
+     * we don't measure (e.g. r3 -> server) must not broadcast a "don't ignore
+     * loss" vote that the endpoint's barrel rule would treat as congestion; and a
+     * known-but-shallow local queue is simply healthy. NEUTRAL is reserved for a
+     * PROBING segment in the gray zone (below), where staying honest is right. */
+    if (!g_cfg.probe_congest || g_seg_rtprop_us == UINT64_MAX) return SEG_PH_RELAX;
+    uint64_t rtp = g_seg_rtprop_us;
+    uint64_t qd  = probe_qdelay_us();
+    uint64_t relax_th = rtp * SEG_RELAX_NUM / SEG_RELAX_DEN;
+    if (relax_th < SEG_QD_JITTER_US) relax_th = SEG_QD_JITTER_US;     /* noise floor */
+    uint64_t cong_th = rtp * SEG_CONG_NUM / SEG_CONG_DEN;
+    if (cong_th < relax_th + SEG_QD_JITTER_US) cong_th = relax_th + SEG_QD_JITTER_US;
+    if (qd <= relax_th) return SEG_PH_RELAX;
+    if (qd >= cong_th && g_bw_saturated) return SEG_PH_CONGESTED;
+    return SEG_PH_NEUTRAL;
 }
+/* Back-compat boolean (unused by the new signaling path, kept for clarity). */
+static inline int seg_congested(void) { return seg_phase() == SEG_PH_CONGESTED; }
 
 /* ----------------------------- hashing -------------------------------- */
 static inline uint32_t fhash(uint32_t id) {
@@ -512,7 +574,7 @@ static void inject_control(struct flow *f, uint8_t type,
 }
 
 /* ----------------------------- CNP injection -------------------------- */
-static void inject_cnp(struct flow *f, uint64_t t) {
+static void inject_cnp(struct flow *f, uint64_t t, uint64_t fair) {
     //
     // Address the flow by tunnel flow_id, NOT by QUIC CID: secnetperf clients
     // use a zero-length source CID, so the relay cannot sniff a usable CID. The
@@ -529,13 +591,20 @@ static void inject_cnp(struct flow *f, uint64_t t) {
     //
     uint8_t severity;
     {
-        uint64_t ratio = f->bytes_per_sec / (g_cfg.threshold_bps ? g_cfg.threshold_bps : 1);
-        if (ratio <= 1)      severity = 50;   /* keep ~50% */
-        else if (ratio >= 5) severity = 90;   /* keep ~10% */
-        else                 severity = (uint8_t)(50 + (ratio - 1) * 10); /* 60..80 */
+        /* Cut toward the FAIR SHARE on this bottleneck (fair = aggregate/active),
+         * not an absolute rate: keep% = fair/rate, so a 4x-over-fair elephant
+         * keeps ~25% while a barely-over-fair flow keeps ~80%. Pulling every
+         * above-fair flow down to ~fair drops the aggregate below capacity and
+         * drains the standing queue (so mice get through) -- a single mild 50%
+         * nudge, scaled against an absolute threshold, did neither. */
+        uint64_t rate = f->bytes_per_sec ? f->bytes_per_sec : 1;
+        uint64_t keep = fair ? (fair * 100 / rate) : 50;   /* % of window to keep */
+        if (keep < 15) keep = 15;                          /* never throttle to ~0 */
+        if (keep > 80) keep = 80;                          /* always a real cut    */
+        severity = (uint8_t)(100 - keep);
     }
     uint8_t buf[CNP_MAX_LEN];
-    int cnp_len = cnp_build(buf, NULL, 0, CNP_SUPPRESS_MS, severity);
+    int cnp_len = cnp_build(buf, NULL, 0, CNP_SUPPRESS_MS, severity, (uint32_t)fair);
     if (cnp_len < 0) return;
 
     inject_control(f, TUNNEL_TYPE_CNP, buf, cnp_len);
@@ -730,6 +799,17 @@ static void process_probe(struct rte_mbuf *m, struct rte_ether_hdr *eth,
          * running min (measured before/between bursts) is the true floor. */
         if (rtt_us < g_seg_rtprop_us) { g_seg_rtprop_us = rtt_us; g_seg_rtprop_stamp = t; }
         g_seg_rtt_us = g_seg_rtt_us ? (g_seg_rtt_us * 7 + rtt_us) / 8 : rtt_us;
+        /* Maintain the windowed-min RTT (standing queue). Accumulate the min of
+         * this window; every SEG_WMIN_WINDOW_US publish it and restart -- so a
+         * queue that drains to the floor in any window resets the standing queue
+         * to ~0, while a persistent queue keeps every window's min elevated. */
+        if (g_rtt_wmin_stamp == 0) g_rtt_wmin_stamp = t;
+        if (rtt_us < g_rtt_wmin_cur) g_rtt_wmin_cur = rtt_us;
+        if (t - g_rtt_wmin_stamp > (uint64_t)SEG_WMIN_WINDOW_US * g_tsc_us) {
+            g_seg_rtt_wmin = g_rtt_wmin_cur;
+            g_rtt_wmin_cur = rtt_us;
+            g_rtt_wmin_stamp = t;
+        }
         g_probe_count++;
         rte_pktmbuf_free(m);
     }
@@ -874,27 +954,35 @@ static void detect_and_inject(uint64_t t) {
         fwd_bps += f->bytes_per_sec; nf++;
     }
 
-    /*
-     * CNP fires only on SELF-INDUCED congestion — the segment RTT is inflating
-     * AND I am the one loading it (my forwarded rate is significant). That
-     * attributes the queue to MY traffic without owning the queue: a downstream
-     * bottleneck I'm filling counts, while RTT rising with my rate flat (背景流
-     * 或换路) does NOT. (Rigorous form: dRTT/d(my rate) > 0; here the conjunction
-     * is sufficient because in our setting my flows are the dominant load.)
-     * Local egress backlog deep is an additional sufficient trigger (I literally
-     * AM the queue). RTT-alone never triggers CNP — it only sets the beacon state.
-     */
-    int self_induced = g_cfg.probe_congest &&
-                       (probe_qdelay_us() > g_cfg.congest_qdelay_us) &&
-                       (fwd_bps > g_cfg.congest_min_bps);
-    int local_bottleneck = shaper_enabled() && (cong_backlog() > g_cfg.congest_q_bytes);
+    /* BBR-native saturation test feeding seg_phase(): has my forwarded rate
+     * plateaued? If it grew appreciably since the last tick I'm still ramping
+     * (NOT at the ceiling); if it's flat/falling while the probe RTT is inflated,
+     * I can't deliver more = I'm pushing against the bottleneck = self-induced.
+     * A small floor gates out trickle traffic (no load to attribute a queue to). */
+    static uint64_t prev_fwd_bps = 0;
+    int growing = fwd_bps > prev_fwd_bps + prev_fwd_bps * SEG_BW_GROW_NUM / SEG_BW_GROW_DEN;
+    g_bw_saturated = (fwd_bps >= SEG_BW_FLOOR_BPS) && !growing;
+    g_fwd_bps = fwd_bps;
+    prev_fwd_bps = fwd_bps;
 
-    if (g_cfg.cnp_on && (self_induced || local_bottleneck)) {
-        /* Top-K elephants by SHARE, not absolute bandwidth: trim the flows above
-         * their fair share (= aggregate / active), largest first. An "elephant"
-         * is whoever takes a big share of THIS bottleneck, so a 10Mbit flow is an
-         * elephant on a 25Mbit link and a mouse on a 1Gbit link -- relative. */
-        uint64_t fair = nf ? (fwd_bps / nf) : 0;
+    /* CNP fires only when the segment phase is CONGESTED: RTT inflated above the
+     * propagation floor AND my rate plateaued (I'm loading the bottleneck), or I
+     * locally own a deep egress backlog. RTT rising with my rate still climbing
+     * or low (background traffic / a re-route) is NEUTRAL and never fires CNP. */
+    /* Hysteresis: a real bottleneck's queue momentarily drains every BBR cycle,
+     * which would blip seg_phase back to NEUTRAL and let the elephants re-ramp
+     * between CNPs. Latch CONGESTED for CONGEST_HOLD_US past the last detection so
+     * CNP fires continuously while the segment is loaded, keeping the aggregate
+     * pinned below capacity (the suppression is fully reversible once it lapses). */
+    if (g_cfg.cnp_on && seg_phase() == SEG_PH_CONGESTED)
+        g_congest_hold_until = t + (uint64_t)CONGEST_HOLD_US * g_tsc_us;
+
+    uint64_t fair = nf ? (fwd_bps / nf) : 0;
+    if (g_cfg.cnp_on && fair > 0 && t <= g_congest_hold_until) {
+        /* Trim EVERY flow above its fair share (= aggregate / active), not just a
+         * single largest -- if two elephants are 5 and 4.9, hitting only the 5
+         * lets the 4.9 backfill and the queue never drains. CNP_TOP_K bounds the
+         * batch; the K largest above-fair flows are chosen. */
         struct flow *top[CNP_TOP_K];
         int n = 0;
         for (uint32_t i = 0; i < g_active_cnt; i++) {
@@ -909,7 +997,7 @@ static void detect_and_inject(uint64_t t) {
                 if (f->bytes_per_sec > top[min]->bytes_per_sec) top[min] = f;
             }
         }
-        for (int i = 0; i < n; i++) inject_cnp(top[i], t);
+        for (int i = 0; i < n; i++) inject_cnp(top[i], t, fair);
     }
 
     /* anti-CNP is now a segment-level HEALTHY broadcast, driven from main_loop
@@ -932,12 +1020,17 @@ static void anticnp_broadcast_tick(uint64_t t) {
     if (period_us > 200000) period_us = 200000;  /* <=200ms */
     if (t - g_bcast_last_tsc < period_us * g_tsc_us) return;
 
-    int congested = seg_congested();
+    /* The beacon is binary on the wire (RELAX vs honest); the sender ignores loss
+     * only when EVERY fresh segment says RELAX (barrel rule). So NEUTRAL and
+     * CONGESTED both map to the honest (ACN_STATE_CONGESTED) "don't ignore loss"
+     * vote; only RELAX (RTT at the floor) lets the sender ignore loss. A
+     * fair-share rate cap (mode b) is attached only on a true CONGESTED phase. */
+    enum seg_phase ph = seg_phase();
     uint8_t  seg_state = ACN_STATE_RELAX;
     uint32_t rate_bps  = 0;
-    if (congested && !g_cfg.force_random) {
+    if (ph != SEG_PH_RELAX && !g_cfg.force_random) {
         seg_state = ACN_STATE_CONGESTED;
-        if (g_cfg.cong_rate) {                       /* mode(b): fair-share cap */
+        if (g_cfg.cong_rate && ph == SEG_PH_CONGESTED) {  /* mode(b): fair-share cap */
             uint32_t n = g_active_cnt ? g_active_cnt : 1;
             rate_bps = (uint32_t)(g_cfg.egress_rate_bps / n);
         }
@@ -946,9 +1039,14 @@ static void anticnp_broadcast_tick(uint64_t t) {
 
     static uint64_t last_log = 0;
     if (t - last_log > g_tsc_hz) {       /* at most ~1 beacon log/sec */
-        printf("[relay] seg%u beacon %s cong=%" PRIu64 "B q=%" PRIu64 "B qdelay=%" PRIu64 "us n=%u rate=%.1fMbit\n",
-               g_cfg.seg_id, seg_state == ACN_STATE_CONGESTED ? "CONGESTED" : "RELAX",
-               cong_backlog(), g_sq_bytes, probe_qdelay_us(), g_active_cnt, (double)((uint64_t)rate_bps * 8) / 1e6);
+        const char *phn = ph == SEG_PH_RELAX ? "RELAX"
+                        : ph == SEG_PH_CONGESTED ? "CONGESTED" : "NEUTRAL";
+        printf("[relay] seg%u beacon %s cong=%" PRIu64 "B q=%" PRIu64 "B qdelay=%" PRIu64
+               "us rtprop=%" PRIu64 "us fwd=%.1fMbit sat=%d n=%u rate=%.1fMbit\n",
+               g_cfg.seg_id, phn, cong_backlog(), g_sq_bytes, probe_qdelay_us(),
+               (g_seg_rtprop_us == UINT64_MAX) ? 0 : g_seg_rtprop_us,
+               (double)(g_fwd_bps * 8) / 1e6, g_bw_saturated, g_active_cnt,
+               (double)((uint64_t)rate_bps * 8) / 1e6);
         last_log = t;
     }
 }
@@ -989,10 +1087,10 @@ static void print_stats(uint64_t t) {
     /* The classifier label this relay would assign right now: CONGESTED if my
      * egress backlog is deep; LOSSY if backlog shallow but flows are losing;
      * else HEALTHY. Printed even with signals off (label-only verification). */
-    const char *label = "HEALTHY";
-    int congested = seg_congested();
-    if (congested)      label = "CONGESTED";
-    else if (loss > 0)  label = "LOSSY";
+    enum seg_phase ph = seg_phase();
+    const char *label = (ph == SEG_PH_CONGESTED) ? "CONGESTED"
+                      : (ph == SEG_PH_NEUTRAL)   ? "NEUTRAL"
+                      : (loss > 0)               ? "LOSSY" : "HEALTHY";
     uint64_t rtprop = (g_seg_rtprop_us == UINT64_MAX) ? 0 : g_seg_rtprop_us;
     printf("[relay] seg%u %s flows=%u big=%u total=%.1fMbit cong=%" PRIu64
            "B q=%" PRIu64 "B loss=%" PRIu64 " drops=%" PRIu64 "/%" PRIu64
@@ -1133,8 +1231,8 @@ static int main_loop(__rte_unused void *arg) {
             if (t - g_probe_last_tsc >= interval_us * g_tsc_us) inject_probe(t);
         }
 
-        anticnp_broadcast_tick(t);   /* healthy-segment broadcast anti-CNP */
-        detect_and_inject(t);
+        detect_and_inject(t);        /* updates bandwidth saturation, fires CNP   */
+        anticnp_broadcast_tick(t);   /* segment-state beacon (reads saturation)   */
         shaper_drain(t);       /* release egress-shaped packets */
         reap_idle(t);
         print_stats(t);
